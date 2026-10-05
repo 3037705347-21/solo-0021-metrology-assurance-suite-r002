@@ -97,13 +97,6 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			)
 		}
 		caseID := m.NextID("case")
-		occupancy, err := domain.NewCaseOccupancy(device.ID, caseID, s.now())
-		if err != nil {
-			return err
-		}
-		if err := m.PutOccupancy(occupancy); err != nil {
-			return err
-		}
 		item, err := domain.NewVerificationCase(
 			caseID,
 			device.ID,
@@ -113,6 +106,13 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 			s.now(),
 		)
 		if err != nil {
+			return err
+		}
+		occupancy, err := domain.NewCaseOccupancy(device.ID, caseID, s.now())
+		if err != nil {
+			return err
+		}
+		if err := m.PutOccupancy(occupancy); err != nil {
 			return err
 		}
 		if err := m.PutCase(item); err != nil {
@@ -224,6 +224,11 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		actor := strings.TrimSpace(input.Actor)
+		reason := strings.TrimSpace(input.Reason)
+		if actor == "" || reason == "" {
+			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
+		}
 		if err := item.Reopen(s.now()); err != nil {
 			return err
 		}
@@ -239,11 +244,6 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
-		}
-		actor := strings.TrimSpace(input.Actor)
-		reason := strings.TrimSpace(input.Reason)
-		if actor == "" || reason == "" {
-			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -280,12 +280,6 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
 		}
-		if err := item.Seal(s.now()); err != nil {
-			return err
-		}
-		if err := m.DeleteOccupancy(item.ID); err != nil {
-			return err
-		}
 		seal, err := domain.NewEvidenceSeal(
 			m.NextID("seal"),
 			item.ID,
@@ -296,6 +290,16 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			s.now(),
 		)
 		if err != nil {
+			return err
+		}
+		if err := item.Seal(s.now()); err != nil {
+			return err
+		}
+		occupancy, exists := m.Occupancy(item.DeviceID)
+		if !exists || !occupancy.Matches(item.DeviceID, item.ID) {
+			return fmt.Errorf("%w: device %s has no occupancy for case %s", domain.ErrStateConflict, item.DeviceID, item.ID)
+		}
+		if err := m.DeleteOccupancy(item.DeviceID); err != nil {
 			return err
 		}
 		if err := m.PutSeal(seal); err != nil {

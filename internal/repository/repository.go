@@ -196,8 +196,11 @@ func (m *Mutation) UpdateOccupancy(item domain.CaseOccupancy) error {
 	return nil
 }
 
-func (m *Mutation) DeleteOccupancy(caseID string) error {
-	delete(m.occupancies, caseID)
+func (m *Mutation) DeleteOccupancy(deviceID string) error {
+	if _, exists := m.occupancies[deviceID]; !exists {
+		return fmt.Errorf("%w: device occupancy %s", domain.ErrNotFound, deviceID)
+	}
+	delete(m.occupancies, deviceID)
 	return nil
 }
 
@@ -315,7 +318,11 @@ func cloneCases(values map[string]domain.VerificationCase) map[string]domain.Ver
 }
 
 func cloneOccupancies(values map[string]domain.CaseOccupancy) map[string]domain.CaseOccupancy {
-	return values
+	result := make(map[string]domain.CaseOccupancy, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
 }
 
 func cloneMeasurements(values map[string][]domain.Measurement) map[string][]domain.Measurement {
