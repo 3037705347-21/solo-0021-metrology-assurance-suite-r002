@@ -88,6 +88,8 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if !device.IsActive() {
 			return fmt.Errorf("%w: device %s is %s", domain.ErrStateConflict, device.ID, device.Status)
 		}
+		// The occupancy projection is the primary gate; the case table scan
+		// below guards the same invariant from the other side.
 		if occupancy, exists := m.Occupancy(device.ID); exists {
 			return fmt.Errorf(
 				"%w: case %s is still %s",
@@ -96,14 +98,17 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 				occupancy.State,
 			)
 		}
+		if active, exists := m.ActiveCaseForDevice(device.ID); exists {
+			return fmt.Errorf(
+				"%w: case %s is still %s",
+				domain.ErrActiveCaseExists,
+				active.ID,
+				active.State,
+			)
+		}
 		caseID := m.NextID("case")
-		occupancy, err := domain.NewCaseOccupancy(device.ID, caseID, s.now())
-		if err != nil {
-			return err
-		}
-		if err := m.PutOccupancy(occupancy); err != nil {
-			return err
-		}
+		// Construct and validate every domain object before touching a
+		// collection so a rejected request leaves nothing behind.
 		item, err := domain.NewVerificationCase(
 			caseID,
 			device.ID,
@@ -115,7 +120,14 @@ func (s *Service) OpenCase(ctx context.Context, input contracts.OpenCaseRequest)
 		if err != nil {
 			return err
 		}
+		occupancy, err := domain.NewCaseOccupancy(device.ID, caseID, s.now())
+		if err != nil {
+			return err
+		}
 		if err := m.PutCase(item); err != nil {
+			return err
+		}
+		if err := m.PutOccupancy(occupancy); err != nil {
 			return err
 		}
 		event, err := domain.NewAuditEvent(
@@ -159,6 +171,18 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
+		occupancy, exists := m.Occupancy(item.DeviceID)
+		if !exists {
+			return fmt.Errorf("%w: device %s has no active occupancy", domain.ErrStateConflict, item.DeviceID)
+		}
+		if occupancy.CaseID != item.ID {
+			return fmt.Errorf(
+				"%w: device %s is occupied by case %s",
+				domain.ErrStateConflict,
+				item.DeviceID,
+				occupancy.CaseID,
+			)
+		}
 		measurement, err := domain.NewMeasurement(
 			m.NextID("measurement"),
 			item.ID,
@@ -173,10 +197,6 @@ func (s *Service) RecordMeasurement(ctx context.Context, caseID string, input co
 		}
 		if err := item.RecordMeasurement(measurement.Accepted, s.now()); err != nil {
 			return err
-		}
-		occupancy, exists := m.Occupancy(item.DeviceID)
-		if !exists {
-			return fmt.Errorf("%w: device %s has no active occupancy", domain.ErrStateConflict, item.DeviceID)
 		}
 		if err := occupancy.Observe(item.State, item.Version, s.now()); err != nil {
 			return err
@@ -224,12 +244,25 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		if !exists {
 			return fmt.Errorf("%w: case %s", domain.ErrNotFound, id)
 		}
-		if err := item.Reopen(s.now()); err != nil {
-			return err
+		actor := strings.TrimSpace(input.Actor)
+		reason := strings.TrimSpace(input.Reason)
+		if actor == "" || reason == "" {
+			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		occupancy, exists := m.Occupancy(item.DeviceID)
 		if !exists {
 			return fmt.Errorf("%w: device %s has no active occupancy", domain.ErrStateConflict, item.DeviceID)
+		}
+		if occupancy.CaseID != item.ID {
+			return fmt.Errorf(
+				"%w: device %s is occupied by case %s",
+				domain.ErrStateConflict,
+				item.DeviceID,
+				occupancy.CaseID,
+			)
+		}
+		if err := item.Reopen(s.now()); err != nil {
+			return err
 		}
 		if err := occupancy.Observe(item.State, item.Version, s.now()); err != nil {
 			return err
@@ -239,11 +272,6 @@ func (s *Service) ReopenCase(ctx context.Context, caseID string, input contracts
 		}
 		if err := m.UpdateCase(item); err != nil {
 			return err
-		}
-		actor := strings.TrimSpace(input.Actor)
-		reason := strings.TrimSpace(input.Reason)
-		if actor == "" || reason == "" {
-			return fmt.Errorf("%w: actor and reason are required", domain.ErrInvalidInput)
 		}
 		event, err := domain.NewAuditEvent(
 			m.NextID("event"),
@@ -276,15 +304,21 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 		if _, exists := m.Seal(item.ID); exists {
 			return fmt.Errorf("%w: case %s", domain.ErrSealAlreadyCreated, item.ID)
 		}
+		occupancy, exists := m.Occupancy(item.DeviceID)
+		if !exists {
+			return fmt.Errorf("%w: device %s has no active occupancy", domain.ErrStateConflict, item.DeviceID)
+		}
+		if occupancy.CaseID != item.ID {
+			return fmt.Errorf(
+				"%w: device %s is occupied by case %s",
+				domain.ErrStateConflict,
+				item.DeviceID,
+				occupancy.CaseID,
+			)
+		}
 		measurement, ok := bestAcceptedMeasurement(m.Measurements(item.ID))
 		if !ok {
 			return fmt.Errorf("%w: an accepted measurement is required before sealing", domain.ErrStateConflict)
-		}
-		if err := item.Seal(s.now()); err != nil {
-			return err
-		}
-		if err := m.DeleteOccupancy(item.ID); err != nil {
-			return err
 		}
 		seal, err := domain.NewEvidenceSeal(
 			m.NextID("seal"),
@@ -296,6 +330,14 @@ func (s *Service) SealCase(ctx context.Context, caseID string, input contracts.S
 			s.now(),
 		)
 		if err != nil {
+			return err
+		}
+		// All validation passed: transition state, release the device hold,
+		// and persist the seal and audit event as one atomic commit.
+		if err := item.Seal(s.now()); err != nil {
+			return err
+		}
+		if err := m.ReleaseOccupancy(item.DeviceID, item.ID); err != nil {
 			return err
 		}
 		if err := m.PutSeal(seal); err != nil {

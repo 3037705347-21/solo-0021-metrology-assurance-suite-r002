@@ -25,9 +25,10 @@ type apiResponse struct {
 }
 
 type harness struct {
-	baseURL string
-	client  *http.Client
-	server  *httptest.Server
+	baseURL       string
+	client        *http.Client
+	server        *httptest.Server
+	readyDeviceID string
 }
 
 func main() {
@@ -156,7 +157,38 @@ func checkOpenVerificationCase() error {
 	if err := expectStatus(second, http.StatusConflict); err != nil {
 		return err
 	}
-	return expectErrorCode(second, "active_case_exists")
+	if err := expectErrorCode(second, "active_case_exists"); err != nil {
+		return err
+	}
+
+	// A rejected submission on a fresh device must not leave an occupancy:
+	// the invalid open fails and a following valid open still succeeds.
+	otherDeviceID, err := h.createDevice("MET-1102")
+	if err != nil {
+		return err
+	}
+	invalid, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": otherDeviceID,
+		"nominal":   25.0,
+		"tolerance": -1.0,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(invalid, http.StatusBadRequest); err != nil {
+		return err
+	}
+	afterReject, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": otherDeviceID,
+		"nominal":   25.0,
+		"tolerance": 0.5,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	return expectStatus(afterReject, http.StatusCreated)
 }
 
 func checkRecordMeasurement() error {
@@ -372,7 +404,41 @@ func checkSealVerification() error {
 	if sealID == "" {
 		return errors.New("evidence seal is missing")
 	}
-	return nil
+
+	// The sealed case must release the device: a new case on the same device
+	// opens successfully, then blocks a second concurrent-style open.
+	reopened, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": h.readyDeviceID,
+		"nominal":   25.0,
+		"tolerance": 0.5,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(reopened, http.StatusCreated); err != nil {
+		return fmt.Errorf("open case on sealed device: %w", err)
+	}
+	newState, err := nestedString(reopened.Body, "case", "state")
+	if err != nil {
+		return err
+	}
+	if newState != "awaiting_measurement" {
+		return fmt.Errorf("new case on sealed device state = %q", newState)
+	}
+	blocked, err := h.request(http.MethodPost, "/cases", map[string]any{
+		"device_id": h.readyDeviceID,
+		"nominal":   25.0,
+		"tolerance": 0.5,
+		"steward":   "Qiao",
+	})
+	if err != nil {
+		return err
+	}
+	if err := expectStatus(blocked, http.StatusConflict); err != nil {
+		return err
+	}
+	return expectErrorCode(blocked, "active_case_exists")
 }
 
 func newHarness() *harness {
@@ -491,6 +557,7 @@ func (h *harness) readyCase(tag string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	h.readyDeviceID = deviceID
 	opened, err := h.openCase(deviceID)
 	if err != nil {
 		return "", err

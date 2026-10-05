@@ -189,15 +189,42 @@ func (m *Mutation) UpdateOccupancy(item domain.CaseOccupancy) error {
 	if err := item.Validate(); err != nil {
 		return err
 	}
-	if _, exists := m.occupancies[item.DeviceID]; !exists {
+	existing, exists := m.occupancies[item.DeviceID]
+	if !exists {
 		return fmt.Errorf("%w: device occupancy %s", domain.ErrNotFound, item.DeviceID)
+	}
+	if existing.CaseID != item.CaseID {
+		return fmt.Errorf(
+			"%w: device %s is occupied by case %s, not %s",
+			domain.ErrStateConflict,
+			item.DeviceID,
+			existing.CaseID,
+			item.CaseID,
+		)
 	}
 	m.occupancies[item.DeviceID] = item
 	return nil
 }
 
-func (m *Mutation) DeleteOccupancy(caseID string) error {
-	delete(m.occupancies, caseID)
+// ReleaseOccupancy removes the device's occupancy. It only releases an
+// occupancy that belongs to the named case; a missing occupancy or one held by
+// a different case is a state conflict so that sealing a case can never detach
+// another case's hold on the device.
+func (m *Mutation) ReleaseOccupancy(deviceID, caseID string) error {
+	occupancy, exists := m.occupancies[deviceID]
+	if !exists {
+		return fmt.Errorf("%w: device %s has no active occupancy", domain.ErrStateConflict, deviceID)
+	}
+	if occupancy.CaseID != caseID {
+		return fmt.Errorf(
+			"%w: device %s is occupied by case %s, not %s",
+			domain.ErrStateConflict,
+			deviceID,
+			occupancy.CaseID,
+			caseID,
+		)
+	}
+	delete(m.occupancies, deviceID)
 	return nil
 }
 
@@ -315,7 +342,11 @@ func cloneCases(values map[string]domain.VerificationCase) map[string]domain.Ver
 }
 
 func cloneOccupancies(values map[string]domain.CaseOccupancy) map[string]domain.CaseOccupancy {
-	return values
+	result := make(map[string]domain.CaseOccupancy, len(values))
+	for key, value := range values {
+		result[key] = value
+	}
+	return result
 }
 
 func cloneMeasurements(values map[string][]domain.Measurement) map[string][]domain.Measurement {
